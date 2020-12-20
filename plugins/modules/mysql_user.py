@@ -340,14 +340,34 @@ VALID_PRIVS = frozenset(('CREATE', 'DROP', 'GRANT', 'GRANT OPTION',
                          'REPLICATION SLAVE ADMIN',
                          'SET USER',))
 
+REDACTED_SECRET = "[redacted]"
+
 
 class InvalidPrivsError(Exception):
     pass
 
+
+class StatementLogger:
+    """Used for logging SQL statements throughout the module."""
+    executed_statements = []
+
+    @classmethod
+    def log(cls, cursor, query, args=None):
+        """Logs the query including the args provided. Note: do NOT log passwords.
+
+        Args:
+            cursor: DB driver cursor object.
+            query: The query to be executed.
+            args: Parameters to be used with the query.
+
+        Returns: None
+        """
+        cls.executed_statements.append(cursor.mogrify(query, args))
+
+
 # ===========================================
 # MySQL module specific support methods.
 #
-
 
 # User Authentication Management changed in MySQL 5.7 and MariaDB 10.2.0
 def use_old_user_mgmt(cursor):
@@ -410,19 +430,27 @@ def sanitize_requires(tls_requires):
     return None
 
 
-def mogrify_requires(query, params, tls_requires):
+def mogrify_tls_requires(query, params, tls_requires):
     if tls_requires:
         if isinstance(tls_requires, dict):
             k, v = zip(*tls_requires.items())
-            requires_query = " AND ".join(("%s %%s" % key for key in k))
-            params += v
+            # Params can be a dict as per the mysql driver APIs, so that should be supported here as well. In this case,
+            # the name of the key in the dict needs to remain in the query. "%s %%(%s)s" becomes "KEY %(KEY)s" which
+            # will later be replaced by the args in dict form.
+            if isinstance(params, dict):
+                requires_query = " AND ".join(("%s %%(%s)s" % (key, key) for key in k))
+                for key, value in tls_requires.items():
+                    params.update({key: value})
+            else:
+                requires_query = " AND ".join(("%s %%s" % key for key in k))
+                params += v
         else:
             requires_query = tls_requires
         query = " REQUIRE ".join((query, requires_query))
     return query, params
 
 
-def do_not_mogrify_requires(query, params, tls_requires):
+def do_not_mogrify_tls_requires(query, params, tls_requires):
     return query, params
 
 
@@ -469,42 +497,47 @@ def user_add(cursor, user, host, host_all, password, encrypted,
     if check_mode:
         return True
 
+    user_secret = None
+
     # Determine what user management method server uses
     old_user_mgmt = use_old_user_mgmt(cursor)
 
-    mogrify = do_not_mogrify_requires if old_user_mgmt else mogrify_requires
+    mogrify_tls = do_not_mogrify_tls_requires if old_user_mgmt else mogrify_tls_requires
+
+    query = ["CREATE USER %(user)s@%(host)s"]
+
+    # Set an initial user_secret to be displayed in the queries output, but it will be replaced before actually
+    # executing the query.
+    query_data = {"user": user, "host": host, "user_secret": REDACTED_SECRET}
 
     if password and encrypted:
-        cursor.execute(*mogrify("CREATE USER %s@%s IDENTIFIED BY PASSWORD %s", (user, host, password), tls_requires))
+        query.append("IDENTIFIED BY PASSWORD %(user_secret)s")
+        user_secret = password
     elif password and not encrypted:
         if old_user_mgmt:
-            cursor.execute(*mogrify("CREATE USER %s@%s IDENTIFIED BY %s", (user, host, password), tls_requires))
+            query.append("IDENTIFIED BY %(user_secret)s")
+            user_secret = password
         else:
             cursor.execute("SELECT CONCAT('*', UCASE(SHA1(UNHEX(SHA1(%s)))))", (password,))
-            encrypted_password = cursor.fetchone()[0]
-            cursor.execute(
-                *mogrify(
-                    "CREATE USER %s@%s IDENTIFIED WITH mysql_native_password AS %s",
-                    (user, host, encrypted_password),
-                    tls_requires,
-                )
-            )
-    elif plugin and plugin_hash_string:
-        cursor.execute(
-            *mogrify(
-                "CREATE USER %s@%s IDENTIFIED WITH %s AS %s", (user, host, plugin, plugin_hash_string), tls_requires
-            )
-        )
-    elif plugin and plugin_auth_string:
-        cursor.execute(
-            *mogrify(
-                "CREATE USER %s@%s IDENTIFIED WITH %s BY %s", (user, host, plugin, plugin_auth_string), tls_requires
-            )
-        )
+            query.append("IDENTIFIED WITH mysql_native_password AS %(user_secret)s")
+            user_secret = cursor.fetchone()[0]
     elif plugin:
-        cursor.execute(*mogrify("CREATE USER %s@%s IDENTIFIED WITH %s", (user, host, plugin), tls_requires))
-    else:
-        cursor.execute(*mogrify("CREATE USER %s@%s", (user, host), tls_requires))
+        query.append("IDENTIFIED WITH %s" % plugin)
+        if plugin_hash_string:
+            query.append("AS %(user_secret)s")
+            user_secret = plugin_hash_string
+        elif plugin_auth_string:
+            query.append("BY %(user_secret)s")
+            user_secret = plugin_auth_string
+
+    query = " ".join(query)
+    StatementLogger.log(cursor, *mogrify_tls(query, query_data, tls_requires))
+
+    # Add the password to query_data and then execute the query. This step is deferred to avoid logging the password in
+    # the queries output.
+    query_data["user_secret"] = user_secret
+    cursor.execute(*mogrify_tls(query, query_data, tls_requires))
+
     if new_priv is not None:
         for db_table, priv in iteritems(new_priv):
             privileges_grant(cursor, user, host, db_table, priv, tls_requires)
@@ -583,20 +616,28 @@ def user_mod(cursor, user, host, host_all, password, encrypted,
                 if module.check_mode:
                     return (True, msg)
                 if old_user_mgmt:
+                    StatementLogger.log(cursor, "SET PASSWORD FOR %s@%s = %s", (user, host, REDACTED_SECRET))
                     cursor.execute("SET PASSWORD FOR %s@%s = %s", (user, host, encrypted_password))
                     msg = "Password updated (old style)"
                 else:
                     try:
+                        StatementLogger.log(cursor, "ALTER USER %s@%s IDENTIFIED WITH mysql_native_password AS %s", (user, host, REDACTED_SECRET))
                         cursor.execute("ALTER USER %s@%s IDENTIFIED WITH mysql_native_password AS %s", (user, host, encrypted_password))
                         msg = "Password updated (new style)"
                     except (mysql_driver.Error) as e:
                         # https://stackoverflow.com/questions/51600000/authentication-string-of-root-user-on-mysql
                         # Replacing empty root password with new authentication mechanisms fails with error 1396
                         if e.args[0] == 1396:
+                            StatementLogger.log(
+                                cursor,
+                                "UPDATE mysql.user SET plugin = %s, authentication_string = %s, Password = '' WHERE User = %s AND Host = %s",
+                                ('mysql_native_password', REDACTED_SECRET, user, host)
+                            )
                             cursor.execute(
                                 "UPDATE mysql.user SET plugin = %s, authentication_string = %s, Password = '' WHERE User = %s AND Host = %s",
                                 ('mysql_native_password', encrypted_password, user, host)
                             )
+                            StatementLogger.log(cursor, "FLUSH PRIVILEGES")
                             cursor.execute("FLUSH PRIVILEGES")
                             msg = "Password forced update"
                         else:
@@ -625,12 +666,26 @@ def user_mod(cursor, user, host, host_all, password, encrypted,
                 update = True
 
             if update:
+                query = ["ALTER USER %(user)s@%(host)s"]
+                query_data = {"user": user, "host": host, "plugin": plugin, "user_secret": REDACTED_SECRET}
+                user_secret = None
+
                 if plugin_hash_string:
-                    cursor.execute("ALTER USER %s@%s IDENTIFIED WITH %s AS %s", (user, host, plugin, plugin_hash_string))
+                    query.append("IDENTIFIED WITH %(plugin)s AS %(user_secret)s")
+                    user_secret = plugin_hash_string
                 elif plugin_auth_string:
-                    cursor.execute("ALTER USER %s@%s IDENTIFIED WITH %s BY %s", (user, host, plugin, plugin_auth_string))
+                    query.append("IDENTIFIED WITH %(plugin)s BY %(user_secret)s")
+                    user_secret = plugin_auth_string
                 else:
-                    cursor.execute("ALTER USER %s@%s IDENTIFIED WITH %s", (user, host, plugin))
+                    query.append("IDENTIFIED WITH %(plugin)s")
+
+                query = " ".join(query)
+                StatementLogger.log(cursor, query, query_data)
+
+                # Add the real password to args after the query has been logged.
+                if user_secret:
+                    query_data["user_secret"] = user_secret
+                cursor.execute(query, query_data)
                 changed = True
 
         # Handle privileges
@@ -695,9 +750,11 @@ def user_mod(cursor, user, host, host_all, password, encrypted,
 
             if tls_requires is not None:
                 query = " ".join((pre_query, "%s@%s"))
-                cursor.execute(*mogrify_requires(query, (user, host), tls_requires))
+                StatementLogger.log(cursor, *mogrify_tls_requires(query, (user, host), tls_requires))
+                cursor.execute(*mogrify_tls_requires(query, (user, host), tls_requires))
             else:
                 query = " ".join((pre_query, "%s@%s REQUIRE NONE"))
+                StatementLogger.log(cursor, query, (user, host))
                 cursor.execute(query, (user, host))
             changed = True
 
@@ -712,8 +769,10 @@ def user_delete(cursor, user, host, host_all, check_mode):
         hostnames = user_get_hostnames(cursor, user)
 
         for hostname in hostnames:
+            StatementLogger.log(cursor, "DROP USER %s@%s", (user, hostname))
             cursor.execute("DROP USER %s@%s", (user, hostname))
     else:
+        StatementLogger.log(cursor, "DROP USER %s@%s", (user, host))
         cursor.execute("DROP USER %s@%s", (user, host))
 
     return True
@@ -829,11 +888,13 @@ def privileges_revoke(cursor, user, host, db_table, priv, grant_option):
         query = ["REVOKE GRANT OPTION ON %s" % db_table]
         query.append("FROM %s@%s")
         query = ' '.join(query)
+        StatementLogger.log(cursor, query, (user, host))
         cursor.execute(query, (user, host))
     priv_string = ",".join([p for p in priv if p not in ('GRANT', 'REQUIRESSL')])
     query = ["REVOKE %s ON %s" % (priv_string, db_table)]
     query.append("FROM %s@%s")
     query = ' '.join(query)
+    StatementLogger.log(cursor, query, (user, host))
     cursor.execute(query, (user, host))
 
 
@@ -846,13 +907,14 @@ def privileges_grant(cursor, user, host, db_table, priv, tls_requires):
     query.append("TO %s@%s")
     params = (user, host)
     if tls_requires and use_old_user_mgmt(cursor):
-        query, params = mogrify_requires(" ".join(query), params, tls_requires)
+        query, params = mogrify_tls_requires(" ".join(query), params, tls_requires)
         query = [query]
     if 'REQUIRESSL' in priv and not tls_requires:
         query.append("REQUIRE SSL")
     if 'GRANT' in priv:
         query.append("WITH GRANT OPTION")
     query = ' '.join(query)
+    StatementLogger.log(cursor, query, params)
     cursor.execute(query, params)
 
 
@@ -998,6 +1060,7 @@ def limit_resources(module, cursor, user, host, resource_limits, check_mode):
 
     query = "ALTER USER %s@%s"
     query += ' WITH %s' % ' '.join(tmp)
+    StatementLogger.log(cursor, query, (user, host))
     cursor.execute(query, (user, host))
     return True
 
@@ -1131,7 +1194,7 @@ def main():
         else:
             changed = False
             msg = "User doesn't exist"
-    module.exit_json(changed=changed, user=user, msg=msg)
+    module.exit_json(changed=changed, user=user, msg=msg, statements=StatementLogger.executed_statements)
 
 
 if __name__ == '__main__':
