@@ -8,6 +8,7 @@
       login_port: '{{ mysql_primary_port }}'
     test_user_name: 'test_user_plugin_auth'
     test_plugin_type: 'mysql_native_password'
+    test_plugin_type_check: 'mysql_native_password'
     test_plugin_hash: '*0CB5B86F23FDC24DB19A29B8854EB860CBC47793'
     test_plugin_auth_string: 'Fdt8fd^34ds'
     test_plugin_new_hash: '*E74368AC90460FA669F6D41BFB7F2A877DB73745'
@@ -16,6 +17,12 @@
     test_default_priv: '*.*:{{ test_default_priv_type }}'
 
   block:
+    # MariaDB handles plugin auth differently. Even if a user is created with mysql_native_password auth, when checking
+    # SHOW CREATE USER 'IDENTIFIED BY PASSWORD' will be shown instead.
+    - name: Change test_plugin_type_check for MariaDB
+      set_fact:
+        test_plugin_type_check: 'IDENTIFIED BY PASSWORD'
+      when: install_type == 'mariadb'
 
     # ============================================================
     # Test plugin auth initially setting a hash and then changing to a different hash.
@@ -38,7 +45,7 @@
       assert:
         that:
           - "result.changed == true"
-          - "'{{ test_plugin_type }}' in show_create_user.stdout"
+          - "'{{ test_plugin_type_check }}' in show_create_user.stdout"
 
     - include: assert_user.yml user_name={{ test_user_name }} priv={{ test_default_priv_type }}
 
@@ -109,7 +116,7 @@
       assert:
         that:
           - "result.changed == true"
-          - "'{{ test_plugin_type }}' in show_create_user.stdout"
+          - "'{{ test_plugin_type_check }}' in show_create_user.stdout"
 
     - include: assert_user.yml user_name={{ test_user_name }} priv={{ test_default_priv_type }}
 
@@ -194,7 +201,7 @@
       assert:
         that:
           - "result.changed == true"
-          - "'{{ test_plugin_type }}' in show_create_user.stdout"
+          - "'{{ test_plugin_type_check }}' in show_create_user.stdout"
 
     - include: assert_user.yml user_name={{ test_user_name }} priv={{ test_default_priv_type }}
 
@@ -279,7 +286,7 @@
       assert:
         that:
           - "result.changed == true"
-          - "'{{ test_plugin_type }}' in show_create_user.stdout"
+          - "'{{ test_plugin_type_check }}' in show_create_user.stdout"
 
     - include: assert_user.yml user_name={{ test_user_name }} priv={{ test_default_priv_type }}
 
@@ -358,7 +365,7 @@
         assert:
           that:
             - "result.changed == true"
-            - "'{{ test_plugin_type }}' in show_create_user.stdout"
+            - "'{{ test_plugin_type_check }}' in show_create_user.stdout"
 
       - include: assert_user.yml user_name={{ test_user_name }} priv={{ test_default_priv_type }}
 

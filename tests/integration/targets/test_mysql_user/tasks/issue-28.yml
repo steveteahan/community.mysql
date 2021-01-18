@@ -5,8 +5,16 @@
       login_password: '{{ mysql_password }}'
       login_host: 127.0.0.1
       login_port: '{{ mysql_primary_port }}'
+    server_cert_file: /tmp/cert.pem
 
   block:
+
+    # Using openssl s_client only returns the actual server certificate and not the CA certificate for MariaDB with the
+    # current test configuration. This can probably be fixed, but deferring that work for now.
+    - name: Change server_cert_file for MariaDB
+      set_fact:
+        server_cert_file: /etc/mysql/ca.pem
+      when: install_type == 'mariadb'
 
     # ============================================================
     - shell: pip show pymysql | awk '/Version/ {print $2}'
@@ -43,7 +51,7 @@
         login_password: '{{ user_password_1 }}'
         login_host: 127.0.0.1
         login_port: '{{ mysql_primary_port }}'
-        ca_cert: /tmp/cert.pem
+        ca_cert: '{{ server_cert_file }}'
       register: result
       ignore_errors: yes
 
@@ -66,7 +74,7 @@
         login_password: '{{ user_password_1 }}'
         login_host: 127.0.0.1
         login_port: '{{ mysql_primary_port }}'
-        ca_cert: /tmp/cert.pem
+        ca_cert: '{{ server_cert_file }}'
         check_hostname: no
       register: result
       ignore_errors: yes

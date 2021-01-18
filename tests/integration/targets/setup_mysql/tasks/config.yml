@@ -1,4 +1,5 @@
 ---
+
 - name: "{{ role_name }} | config | download mysql tarball"
   get_url:
     url: "{{ install_src }}"
@@ -9,7 +10,23 @@
     cmd: "dbdeployer unpack {{ dbdeployer_sandbox_download_dir }}/{{ install_tarball }}"
     creates: "{{ dbdeployer_sandbox_binary_dir }}/{{ install_version }}"
 
+# Setup self-signed certificates for MariaDB. MySQL doesn't need this step because it is handled by default.
+- name: "{{ role_name }} | config | mariadb certificate authority"
+  shell:
+    cmd: |
+      openssl genrsa 2048 > /tmp/ca-key.pem
+      openssl req -new -x509 -nodes -subj '/CN=mariadb-tests-ca/' -days 1095 -key /tmp/ca-key.pem -out /etc/mysql/ca.pem
+  when: install_type == 'mariadb'
+
+- name: "{{ role_name }} | config | mariadb key and certificate"
+  shell:
+    cmd: |
+      openssl req -newkey rsa:2048 -subj '/CN=mariadb-tests-cert/' -nodes -keyout /tmp/server-key.pem -out /tmp/server-req.pem
+      openssl rsa -in /tmp/server-key.pem -out /etc/mysql/server-key.pem
+      openssl x509 -req -in /tmp/server-req.pem -days 365 -CA /etc/mysql/ca.pem -CAkey /tmp/ca-key.pem -set_serial 01 -out /etc/mysql/server-cert.pem
+  when: install_type == 'mariadb'
+
 - name: "{{ role_name }} | config | setup replication topology"
   shell:
-    cmd: "dbdeployer deploy multiple {{ install_version }} --base-port {{ mysql_base_port }} --my-cnf-options=\"master_info_repository='TABLE'\" --my-cnf-options=\"relay_log_info_repository='TABLE'\""
+    cmd: "dbdeployer deploy multiple {{ install_version }} --base-port {{ mysql_base_port }} --my-cnf-options=\"master_info_repository='TABLE'\" --my-cnf-options=\"relay_log_info_repository='TABLE'\" --my-cnf-options=\"ssl-ca=/etc/mysql/ca.pem\" --my-cnf-options=\"ssl-cert=/etc/mysql/server-cert.pem\" --my-cnf-options=\"ssl-key=/etc/mysql/server-key.pem\""
     creates: "{{ dbdeployer_sandbox_home_dir }}/multi_msb_{{ install_version|replace('.','_') }}"

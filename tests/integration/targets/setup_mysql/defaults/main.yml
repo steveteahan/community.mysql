@@ -5,9 +5,9 @@ home_dir: /root
 
 percona_client_version: 5.7
 
-mariadb_install: false
+mariadb_install: true
 
 mysql_version: 8.0.22
-mariadb_version: 10.5.4
+mariadb_version: 10.2.36
 
 mysql_base_port: 3306
